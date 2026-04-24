@@ -2,7 +2,7 @@
 # Submit the AMR Navigation Pipeline as OSMO workflows
 #
 # Submits two OSMO workflows:
-#   1. Data pipeline (combination workflow) — stages 1-5 with parallel rendering
+#   1. Data pipeline (combination workflow) — stages 1-5, single-task rendering
 #   2. Training workflow (single-task) — stage 6 on P-series Capacity Blocks
 #
 # Prerequisites:
@@ -65,7 +65,7 @@ echo "--- Submitting Data Pipeline (combination workflow) ---"
 envsubst < "${SCRIPT_DIR}/data-pipeline-workflow.yaml" | osmo workflow submit -f -
 
 echo "  Data pipeline submitted: amr-data-pipeline-${RUN_ID}"
-echo "  Parallel rendering: rgb + depth + segmentation on 3 G-series GPUs"
+echo "  Stage 4 renders rgb + depth + segmentation in a single pass on 1 G-series GPU"
 
 # Submit training workflow (single-task — stage 6)
 if [ "${SKIP_TRAINING:-false}" != "true" ]; then

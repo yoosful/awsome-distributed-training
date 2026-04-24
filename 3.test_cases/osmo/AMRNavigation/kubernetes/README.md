@@ -47,7 +47,9 @@ The pipeline is split into two OSMO workflows:
 
 ### Data Pipeline (combination workflow)
 
-Uses OSMO groups for parallel execution. Group 4 runs 3 render passes concurrently:
+Each group runs serially; `stage4_render.py` produces rgb + depth +
+semantic_segmentation in a single Replicator BasicWriter pass, so Group 4
+is one GPU, not three.
 
 ```
 Group 1: scene-setup          (1 GPU, G-series)
@@ -56,10 +58,7 @@ Group 2: spatial-analysis     (1 GPU, G-series)
     │
 Group 3: trajectory-planning  (1 GPU, G-series)
     │
-Group 4: multi-modal-render   (3 GPUs in parallel, G-series)
-    ├── render-rgb
-    ├── render-depth
-    └── render-segmentation
+Group 4: multi-modal-render   (1 GPU, G-series; rgb + depth + seg in one pass)
     │
 Group 5: domain-augmentation  (1 GPU, G-series)
 ```
@@ -118,12 +117,12 @@ osmo workflow list
 osmo workflow status amr-data-pipeline-${RUN_ID}
 osmo workflow status amr-training-${RUN_ID}
 
-# Watch pods (see parallel rendering in Group 4)
+# Watch pods
 kubectl get pods -n isaac-sim -w
 
 # Check specific task logs
-osmo workflow logs amr-data-pipeline-${RUN_ID} --task render-rgb
-osmo workflow logs amr-data-pipeline-${RUN_ID} --task render-depth
+osmo workflow logs amr-data-pipeline-${RUN_ID} --task render
+osmo workflow logs amr-data-pipeline-${RUN_ID} --task domain-augment
 osmo workflow logs amr-training-${RUN_ID} --task train-evaluate
 ```
 
@@ -133,13 +132,12 @@ osmo workflow logs amr-training-${RUN_ID} --task train-evaluate
 # List all stage outputs
 aws s3 ls s3://${S3_BUCKET}/amr-pipeline/${RUN_ID}/ --recursive --summarize
 
-# Multi-modal render outputs (produced in parallel)
-aws s3 ls s3://${S3_BUCKET}/amr-pipeline/${RUN_ID}/rgb/
-aws s3 ls s3://${S3_BUCKET}/amr-pipeline/${RUN_ID}/depth/
-aws s3 ls s3://${S3_BUCKET}/amr-pipeline/${RUN_ID}/segmentation/
-
-# Augmented data + training results
-aws s3 ls s3://${S3_BUCKET}/amr-pipeline/${RUN_ID}/augmented/
+# Per-stage prefixes (stage 4 emits all three modalities into raw-v1/)
+aws s3 ls s3://${S3_BUCKET}/amr-pipeline/${RUN_ID}/scene/
+aws s3 ls s3://${S3_BUCKET}/amr-pipeline/${RUN_ID}/occupancy/
+aws s3 ls s3://${S3_BUCKET}/amr-pipeline/${RUN_ID}/trajectories/
+aws s3 ls s3://${S3_BUCKET}/amr-pipeline/${RUN_ID}/raw-v1/
+aws s3 ls s3://${S3_BUCKET}/amr-pipeline/${RUN_ID}/augmented-v2/
 aws s3 ls s3://${S3_BUCKET}/amr-pipeline/${RUN_ID}/results/
 ```
 
@@ -152,7 +150,7 @@ aws s3 ls s3://${S3_BUCKET}/amr-pipeline/${RUN_ID}/results/
 | `3.submit-pipeline.sh` | Submit data pipeline + training workflows |
 | `4.verify-osmo.sh` | Pre-flight check for OSMO control plane |
 | `serviceaccount.yaml` | IRSA ServiceAccount for S3 access |
-| `data-pipeline-workflow.yaml` | OSMO combination workflow (stages 1-5, parallel rendering) |
+| `data-pipeline-workflow.yaml` | OSMO combination workflow (stages 1-5, single-pass rendering) |
 | `training-workflow.yaml` | OSMO single-task workflow (stage 6, P-series) |
 | `amr-pipeline-workflow.yaml` | Full 6-stage sequential pipeline (reference) |
 | `smoke-test-workflow.yaml` | CPU-only OSMO smoke test (no GPU needed) |
@@ -182,5 +180,6 @@ kubectl delete namespace isaac-sim
 | Vulkan errors in logs | Missing GPU toolkit | Enable `toolkit.enabled=true` in GPU Operator values |
 | Workflow timeout | Shader compilation slow | Increase `timeout` in workflow YAML |
 | S3 `AccessDenied` | IRSA misconfigured | Check ServiceAccount annotation and IAM role trust policy |
-| Group 4 only 1 pod | Karpenter scaling lag | Check NodePool limits — need 3 G-series GPUs for parallel render |
+| Stage 4 OOM or stuck | Single pod with rgb+depth+seg is memory-heavy | Use g5.4xlarge or larger; 1 GPU is enough (all modalities rendered in one pass) |
+| ECR `400 Registry authentication failed` | OSMO v6.2 validates registries via Docker v2 token protocol; ECR uses SigV4 IAM | See "ECR / custom registry" section in top-level README — use Skopeo → in-cluster mirror or a public mirror |
 | Training NaN loss | Bad augmented data | Inspect augmented/ images, reduce learning rate |
