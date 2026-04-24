@@ -5,23 +5,20 @@
 # workflow so it can be scheduled independently on P-series Capacity Blocks.
 #
 # Group execution order:
-#   scene-setup ──> spatial-analysis ──> trajectory-planning ──┐
-#                                                              ├──> domain-augmentation
-#                                   multi-modal-render ────────┘
-#                                   (rgb + depth + segmentation in parallel)
+#   scene-setup ──> spatial-analysis ──> trajectory-planning ──> multi-modal-render ──> domain-augmentation
+#
+# Stage 4 renders rgb + depth + semantic_segmentation in a single
+# Replicator BasicWriter pass — the script does not split by modality.
 #
 # Prerequisites:
 #   - OSMO v6.2+ control plane running on the cluster
-#   - ECR registry added to credential_config.disable_registry_validation
-#     (OSMO's Docker token auth is incompatible with ECR — see PROGRESS.md)
-#   - Container images pushed to ECR (see 1.build-container.sh)
+#   - Container images pushed to a Docker Registry v2-compatible registry.
+#     ECR is NOT directly supported: OSMO validates registries with the
+#     Docker v2 token protocol, which ECR does not implement. See README
+#     for the Skopeo → in-cluster-mirror workaround, or use a public mirror.
+#   - RUN_ID and S3_BUCKET must be exported before envsubst
 #
 # Submit:  envsubst < data-pipeline-workflow.yaml | osmo workflow submit -f -
-#   or via REST API:
-#     YAML=$(envsubst < data-pipeline-workflow.yaml)
-#     curl -X POST http://osmo-service:8000/api/pool/default/workflow \
-#       -H "Content-Type: application/json" \
-#       -d "{\"file\": $(echo "$YAML" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read()))')}"
 #
 # Monitor: osmo workflow list
 #
@@ -43,6 +40,8 @@ workflow:
           args:
             - |
               /isaac-sim/scripts/stage1_scene_setup.py \
+                --s3_bucket ${S3_BUCKET} \
+                --run_id ${RUN_ID} \
                 --output_dir {{output}}/scene \
                 --num_aisles ${NUM_AISLES:-4} \
                 --headless
@@ -61,6 +60,8 @@ workflow:
           args:
             - |
               /isaac-sim/scripts/stage2_occupancy_map.py \
+                --s3_bucket ${S3_BUCKET} \
+                --run_id ${RUN_ID} \
                 --scene_dir {{input:0}}/scene \
                 --output_dir {{output}}/occupancy \
                 --headless
@@ -81,6 +82,8 @@ workflow:
           args:
             - |
               /isaac-sim/scripts/stage3_trajectory_gen.py \
+                --s3_bucket ${S3_BUCKET} \
+                --run_id ${RUN_ID} \
                 --occupancy_dir {{input:0}}/occupancy \
                 --output_dir {{output}}/trajectories \
                 --num_trajectories ${NUM_TRAJECTORIES:-10} \
@@ -92,66 +95,26 @@ workflow:
             cpu: 16
             memory: 32Gi
 
-    # ── Group 4: Multi-modal rendering (3 tasks in PARALLEL) ────────────
+    # ── Group 4: Multi-modal rendering (single pass) ────────────────────
     #
-    # Three render passes run concurrently on separate G-series GPUs:
-    #   - RGB: photo-realistic color images
-    #   - Depth: per-pixel depth maps for 3D reasoning
-    #   - Segmentation: semantic labels for each pixel
-    #
-    # All three consume the same scene + trajectory data.
-    # The lead task (render-rgb) gates group completion.
+    # stage4_render.py renders RGB + depth (distance_to_image_plane) +
+    # semantic_segmentation together via a single Replicator BasicWriter
+    # pass. This is one task, not three — splitting by modality would
+    # require a --render_mode arg that the script does not accept.
     - name: multi-modal-render
       tasks:
-        - name: render-rgb
+        - name: render
           lead: true
           image: ${ISAAC_SIM_IMAGE_URI}
           command: ["/isaac-sim/python.sh"]
           args:
             - |
               /isaac-sim/scripts/stage4_render.py \
+                --s3_bucket ${S3_BUCKET} \
+                --run_id ${RUN_ID} \
                 --scene_dir {{input:0}}/scene \
                 --trajectory_dir {{input:1}}/trajectories \
-                --output_dir {{output}}/rgb \
-                --render_mode rgb \
-                --headless
-          inputs:
-            - task: build-scene
-            - task: trajectory-gen
-          resources:
-            gpu: 1
-            cpu: 16
-            memory: 32Gi
-
-        - name: render-depth
-          image: ${ISAAC_SIM_IMAGE_URI}
-          command: ["/isaac-sim/python.sh"]
-          args:
-            - |
-              /isaac-sim/scripts/stage4_render.py \
-                --scene_dir {{input:0}}/scene \
-                --trajectory_dir {{input:1}}/trajectories \
-                --output_dir {{output}}/depth \
-                --render_mode depth \
-                --headless
-          inputs:
-            - task: build-scene
-            - task: trajectory-gen
-          resources:
-            gpu: 1
-            cpu: 16
-            memory: 32Gi
-
-        - name: render-segmentation
-          image: ${ISAAC_SIM_IMAGE_URI}
-          command: ["/isaac-sim/python.sh"]
-          args:
-            - |
-              /isaac-sim/scripts/stage4_render.py \
-                --scene_dir {{input:0}}/scene \
-                --trajectory_dir {{input:1}}/trajectories \
-                --output_dir {{output}}/segmentation \
-                --render_mode segmentation \
+                --output_dir {{output}}/raw-v1 \
                 --headless
           inputs:
             - task: build-scene
@@ -171,10 +134,12 @@ workflow:
           args:
             - |
               /scripts/stage5_domain_augment.py \
-                --input_dir {{input:0}}/rgb \
-                --output_dir {{output}}/augmented
+                --s3_bucket ${S3_BUCKET} \
+                --run_id ${RUN_ID} \
+                --input_dir {{input:0}}/raw-v1 \
+                --output_dir {{output}}/augmented-v2
           inputs:
-            - task: render-rgb
+            - task: render
           resources:
             gpu: 1
             cpu: 16

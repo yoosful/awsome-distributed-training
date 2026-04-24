@@ -35,22 +35,33 @@ def parse_args():
     parser.add_argument("--image_width", type=int, default=640)
     parser.add_argument("--image_height", type=int, default=480)
     parser.add_argument("--headless", action="store_true", default=True)
+    parser.add_argument(
+        "--use_cosmos_writer",
+        action="store_true",
+        default=False,
+        help=(
+            "If set, use Replicator CosmosWriter (outputs videos). "
+            "Default is BasicWriter which writes per-frame PNG/NPY — "
+            "matches what stage 5 (domain augmentation) consumes."
+        ),
+    )
     return parser.parse_args()
 
 
 def setup_writer(output_dir, use_cosmos=False):
-    """Set up Replicator writer. Try CosmosWriter, fallback to BasicWriter."""
+    """Set up Replicator writer. Try CosmosWriter, fallback to BasicWriter.
+
+    Note: in Isaac Sim 5.1 / Replicator 1.11, CosmosWriter.initialize() does
+    not accept rgb=/depth=/semantic_segmentation= kwargs — those modalities
+    are enabled by default. Passing them raises TypeError, which is why we
+    keep BasicWriter as the default fallback path.
+    """
     import omni.replicator.core as rep
 
     if use_cosmos:
         try:
             writer = rep.writers.get("CosmosWriter")
-            writer.initialize(
-                output_dir=output_dir,
-                rgb=True,
-                depth=True,
-                semantic_segmentation=True,
-            )
+            writer.initialize(output_dir=output_dir)
             print("[Stage4] Using CosmosWriter")
             return writer, "cosmos"
         except Exception as e:
@@ -144,7 +155,7 @@ def main():
     )
 
     os.makedirs(args.output_dir, exist_ok=True)
-    writer, writer_type = setup_writer(args.output_dir, use_cosmos=True)
+    writer, writer_type = setup_writer(args.output_dir, use_cosmos=args.use_cosmos_writer)
     writer.attach([render_product])
 
     total_frames = 0
